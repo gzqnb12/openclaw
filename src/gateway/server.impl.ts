@@ -1,3 +1,16 @@
+/**
+ * Gateway Server Implementation
+ * ----------------------------
+ * 这是 OpenClaw Gateway 的心脏。它负责启动整个 Gateway 服务，组装所有子系统，
+ * 并管理整个应用程序的生命周期。
+ * 
+ * 主要职责：
+ * 1. 加载和迁移配置 (Config Loading & Migration)
+ * 2. 初始化核心运行时状态 (Runtime State - HTTP/WS Servers)
+ * 3. 组装各子系统 (Subsystems - Cron, Discovery, Channels, Agents)
+ * 4. 挂载 WebSocket 处理器 (WS Handlers - RPC Methods)
+ * 5. 管理服务生命周期 (Startup, Hot Reload, Shutdown)
+ */
 import path from "node:path";
 import type { CanvasHostServer } from "../canvas-host/server.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
@@ -8,6 +21,7 @@ import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent
 import { registerSkillsChangeListener } from "../agents/skills/refresh.js";
 import { initSubagentRegistry } from "../agents/subagent-registry.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
+// --- CLI & Core Config Imports ---
 import { formatCliCommand } from "../cli/command-format.js";
 import { createDefaultDeps } from "../cli/deps.js";
 import {
@@ -25,6 +39,7 @@ import {
   resolveControlUiRootOverrideSync,
   resolveControlUiRootSync,
 } from "../infra/control-ui-assets.js";
+// --- Infrastructure Imports (Diagnostics, Env, Approval, Heartbeat) ---
 import { isDiagnosticsEnabled } from "../infra/diagnostic-events.js";
 import { logAcceptedEnvOption } from "../infra/env.js";
 import { createExecApprovalForwarder } from "../infra/exec-approval-forwarder.js";
@@ -42,6 +57,7 @@ import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
 import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
+// --- Server Core Components Imports ---
 import { startGatewayConfigReloader } from "./config-reload.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import { NodeRegistry } from "./node-registry.js";
@@ -152,6 +168,8 @@ export type GatewayServerOptions = {
   ) => Promise<void>;
 };
 
+// 主入口函数：启动 Gateway 服务
+// 就像主板 BIOS，这一步按顺序初始化所有硬件（子系统）并加载操作系统（API Server）
 export async function startGatewayServer(
   port = 18789,
   opts: GatewayServerOptions = {},
@@ -167,6 +185,10 @@ export async function startGatewayServer(
     description: "raw stream log path override",
   });
 
+  // 1. 配置加载与迁移层
+  // ----------------------------------------------------------------
+  // 在启动任何服务前，必须确保配置是最新且合法的。
+  // 支持从旧版本配置自动迁移 (Migrate)，并进行 Schema 校验。
   let configSnapshot = await readConfigFileSnapshot();
   if (configSnapshot.legacyIssues.length > 0) {
     if (isNixMode) {
@@ -203,6 +225,7 @@ export async function startGatewayServer(
     );
   }
 
+  // 自动启用插件逻辑 (如检测到 Docker 环境自动开启 Docker 插件)
   const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
   if (autoEnable.changes.length > 0) {
     try {
@@ -217,6 +240,9 @@ export async function startGatewayServer(
     }
   }
 
+  // 2. 基础服务初始化
+  // ----------------------------------------------------------------
+  // 加载最终配置，初始化诊断、信号处理和子 Agent 注册表。
   const cfgAtStart = loadConfig();
   const diagnosticsEnabled = isDiagnosticsEnabled(cfgAtStart);
   if (diagnosticsEnabled) {
@@ -226,6 +252,9 @@ export async function startGatewayServer(
   initSubagentRegistry();
   const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
   const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
+  // 3. 插件与 RPC 方法加载
+  // ----------------------------------------------------------------
+  // 扫描插件目录，加载第三方插件，并将插件提供的 RPC 方法合并到基础方法表中。
   const baseMethods = listGatewayMethods();
   const { pluginRegistry, gatewayMethods: baseGatewayMethods } = loadGatewayPlugins({
     cfg: cfgAtStart,
@@ -243,6 +272,9 @@ export async function startGatewayServer(
   const channelMethods = listChannelPlugins().flatMap((plugin) => plugin.gatewayMethods ?? []);
   const gatewayMethods = Array.from(new Set([...baseGatewayMethods, ...channelMethods]));
   let pluginServices: PluginServicesHandle | null = null;
+  // 4. 运行时配置解析
+  // ----------------------------------------------------------------
+  // 将静态 YAML 配置与启动参数 (opts/env) 合并，决定最终的监听地址、端口、Auth 等。
   const runtimeConfig = await resolveGatewayRuntimeConfig({
     cfg: cfgAtStart,
     port,
@@ -301,6 +333,8 @@ export async function startGatewayServer(
       : { kind: "missing" };
   }
 
+  // 5. 初始化辅助服务 (Wizard, Deps, TLS)
+  // ----------------------------------------------------------------
   const wizardRunner = opts.wizardRunner ?? runOnboardingWizard;
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
 
@@ -310,6 +344,11 @@ export async function startGatewayServer(
   if (cfgAtStart.gateway?.tls?.enabled && !gatewayTls.enabled) {
     throw new Error(gatewayTls.error ?? "gateway tls: failed to enable");
   }
+  // 6. 创建核心运行时状态 (The Heart)
+  // ----------------------------------------------------------------
+  // createGatewayRuntimeState 是最“重”的构建函数。
+  // 它负责创建物理的 HTTP Server, WebSocket Server, Broadcaster (广播器),
+  // 以及管理连接状态 (Clients) 和去重缓存 (Dedupe)。
   const {
     canvasHost,
     httpServer,
@@ -352,6 +391,10 @@ export async function startGatewayServer(
     logPlugins,
   });
   let bonjourStop: (() => Promise<void>) | null = null;
+  // 7. 子系统启动与挂载
+  // ----------------------------------------------------------------
+  
+  // Node Registry: 管理连接的物理节点（手机/电脑）及其能力 (Caps)
   const nodeRegistry = new NodeRegistry();
   const nodePresenceTimers = new Map<string, ReturnType<typeof setInterval>>();
   const nodeSubscriptions = createNodeSubscriptionManager();
@@ -372,6 +415,7 @@ export async function startGatewayServer(
   const hasMobileNodeConnected = () => hasConnectedMobileNode(nodeRegistry);
   applyGatewayLaneConcurrency(cfgAtStart);
 
+  // Cron Service: 定时任务调度器
   let cronState = buildGatewayCronService({
     cfg: cfgAtStart,
     deps,
@@ -379,6 +423,7 @@ export async function startGatewayServer(
   });
   let { cron, storePath: cronStorePath } = cronState;
 
+  // Channel Manager: 管理聊天渠道 (Telegram/Discord等) 的生命周期
   const channelManager = createChannelManager({
     loadConfig,
     channelLogs,
@@ -388,6 +433,7 @@ export async function startGatewayServer(
     channelManager;
 
   const machineDisplayName = await getMachineDisplayName();
+  // Discovery: 启动 mDNS 和 Tailscale 广播，让局域网设备能自动发现 Gateway
   const discovery = await startGatewayDiscovery({
     machineDisplayName,
     port,
@@ -402,6 +448,7 @@ export async function startGatewayServer(
   });
   bonjourStop = discovery.bonjourStop;
 
+  // Skills Sync: 负责将与节点相关的技能配置同步给远程节点
   setSkillsRemoteRegistry(nodeRegistry);
   void primeRemoteSkillsCache();
   // Debounce skills-triggered node probes to avoid feedback loops and rapid-fire invokes.
@@ -423,6 +470,7 @@ export async function startGatewayServer(
     }, skillsRefreshDelayMs);
   });
 
+  // Maintenance Timers: 启动心跳 (Tick)、健康检查 (Health) 和缓存清理 (Cleanup)
   const { tickInterval, healthInterval, dedupeCleanup } = startGatewayMaintenanceTimers({
     broadcast,
     nodeSendToAllSubscribed,
@@ -440,6 +488,7 @@ export async function startGatewayServer(
     nodeSendToSession,
   });
 
+  // Agent Events: 处理 Agent 产生的 Token 生成、工具调用等事件，并通过 WS 广播
   const agentUnsub = onAgentEvent(
     createAgentEventHandler({
       broadcast,
@@ -461,6 +510,7 @@ export async function startGatewayServer(
 
   void cron.start().catch((err) => logCron.error(`failed to start: ${String(err)}`));
 
+  // Exec Approval: 敏感操作审批管理器
   const execApprovalManager = new ExecApprovalManager();
   const execApprovalForwarder = createExecApprovalForwarder();
   const execApprovalHandlers = createExecApprovalHandlers(execApprovalManager, {
@@ -469,6 +519,10 @@ export async function startGatewayServer(
 
   const canvasHostServerPort = (canvasHostServer as CanvasHostServer | null)?.port;
 
+  // 8. 挂载 WebSocket 业务逻辑 (The Brain Wiring)
+  // ----------------------------------------------------------------
+  // 这一步将 WebSocket Server (wss) 与具体的业务逻辑 (gatewayMethods) 绑定。
+  // 同时注入了 Context 上下文，包含所有子系统的句柄 (Registry, Cron, Broadcast...)
   attachGatewayWsHandlers({
     wss,
     clients,
@@ -527,6 +581,9 @@ export async function startGatewayServer(
       broadcastVoiceWakeChanged,
     },
   });
+  // 9. 启动收尾 (Startup Finalization)
+  // ----------------------------------------------------------------
+  // 打印启动日志，安排更新检查，启动 Tailscale 暴露服务。
   logGatewayStartup({
     cfg: cfgAtStart,
     bindHost,
@@ -546,6 +603,7 @@ export async function startGatewayServer(
   });
 
   let browserControl: Awaited<ReturnType<typeof startBrowserControlServerIfEnabled>> = null;
+  // Sidecars: 启动伴生服务，如 Browser Control (浏览器自动化) 和 Plugin Services
   ({ browserControl, pluginServices } = await startGatewaySidecars({
     cfg: cfgAtStart,
     pluginRegistry,
@@ -558,6 +616,9 @@ export async function startGatewayServer(
     logBrowser,
   }));
 
+  // 10. 热重载与关闭处理 (Hot Reload & Shutdown)
+  // ----------------------------------------------------------------
+  // 创建热重载处理器，允许在不重启进程的情况下更新 hooks/cron 配置
   const { applyHotReload, requestGatewayRestart } = createGatewayReloadHandlers({
     deps,
     broadcast,
@@ -597,6 +658,7 @@ export async function startGatewayServer(
     watchPath: CONFIG_PATH,
   });
 
+  // 创建关闭处理器，确保按相反顺序优雅停止所有子系统
   const close = createGatewayCloseHandler({
     bonjourStop,
     tailscaleCleanup,
