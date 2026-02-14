@@ -57,6 +57,17 @@ type DispatchTelegramMessageParams = {
   resolveBotTopicsEnabled: ResolveBotTopicsEnabled;
 };
 
+// ------------------------------------------------------------------
+// 消息分发器 (Message Dispatcher)
+// ------------------------------------------------------------------
+// 此函数将 Telegram 特定的消息上下文桥接到通用的 OpenClaw `auto-reply` 子系统。
+//
+// 关键职责 (Key Responsibilities)：
+// 1. 设置正在输入 (typing) 指示器和草稿流式传输 (如果启用)。
+// 2. 解析贴纸描述 (vision cache) (如果需要)。
+// 3. 调用 `dispatchReplyWithBufferedBlockDispatcher`。这是 **交接点 (HANDOFF point)**，
+//    控制权离开 Telegram 插件，进入核心 Agent 运行时 (Core Runtime)。
+//    (参见 `src/auto-reply/reply/provider-dispatcher.ts`)
 export const dispatchTelegramMessage = async ({
   context,
   bot,
@@ -69,6 +80,9 @@ export const dispatchTelegramMessage = async ({
   opts,
   resolveBotTopicsEnabled,
 }: DispatchTelegramMessageParams) => {
+  // 提取上下文数据
+  // 从 `buildTelegramMessageContext` 创建的上下文中解构出核心数据。
+  // `ctxPayload` 是标准化的消息载荷，将被传递给 Agent。
   const {
     ctxPayload,
     primaryCtx,
@@ -251,16 +265,34 @@ export const dispatchTelegramMessage = async ({
     skippedNonSilent: 0,
   };
 
+  // --------------------------------------------------------------
+  // 4.2 核心交接 (Core Handoff)
+  // --------------------------------------------------------------
+  // 这里我们调用 `dispatchReplyWithBufferedBlockDispatcher`。
+  // 这是一个非常关键的步骤：
+  // - 它接受标准化的 `ctxPayload`。
+  // - 它配置了回复的回调函数 (deliver, onReplyStart 等)。
+  // - **重要**: 调用此函数后，OpenClaw 的核心逻辑接管，开始：
+  //   1. 路由 (Routing)
+  //   2. 提示词构建 (Prompt Engineering)
+  //   3. LLM 调用 (Agent Execution)
+  //   4. 工具执行 (Tool Use)
   const { queuedFinal } = await dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg,
     dispatcherOptions: {
       ...prefixOptions,
+      // --------------------------------------------------------------
+      // 4.3 回复投递回调 (Delivery Callback)
+      // --------------------------------------------------------------
+      // 当 Agent 生成回复（流式块或完整消息）时，核心系统会调用这个 `deliver` 函数。
+      // 我们在这里负责将 Agent 的回复转换回 Telegram 的 API 调用 (`sendMessage`)。
       deliver: async (payload, info) => {
         if (info.kind === "final") {
           await flushDraft();
           draftStream?.stop();
         }
+        // 调用 `deliverReplies` 将内容发送到 Telegram
         const result = await deliverReplies({
           replies: [payload],
           chatId: String(chatId),
@@ -288,6 +320,7 @@ export const dispatchTelegramMessage = async ({
       onError: (err, info) => {
         runtime.error?.(danger(`telegram ${info.kind} reply failed: ${String(err)}`));
       },
+      // 当 Agent 开始思考或生成时，发送 "正在输入..." 状态
       onReplyStart: createTypingCallbacks({
         start: sendTyping,
         onStartError: (err) => {

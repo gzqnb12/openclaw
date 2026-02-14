@@ -51,6 +51,14 @@ export type AgentRunLoopResult =
     }
   | { kind: "final"; payload: ReplyPayload };
 
+// ------------------------------------------------------------------
+// 9. Agent 执行驾驭器 (Agent Execution Harness)
+// ------------------------------------------------------------------
+// 此函数是 Agent 运行的“驾驭者”或“监工”。
+// 它不直接实现 ReAct 循环（那个在 `runEmbeddedPiAgent` 里），但它负责：
+// 1. **错误恢复 (Fault Tolerance)**：处理上下文溢出、角色顺序错误等，并以此触发会话重置。
+// 2. **模型回退 (Model Fallback)**：如果首选模型挂了，尝试备用模型。
+// 3. **结果处理 (Result Handling)**：处理心跳包 stripping、流式清理等。
 export async function runAgentTurnWithFallback(params: {
   commandBody: string;
   followupRun: FollowupRun;
@@ -98,8 +106,17 @@ export async function runAgentTurnWithFallback(params: {
   let fallbackModel = params.followupRun.run.model;
   let didResetAfterCompactionFailure = false;
 
+  // --------------------------------------------------------------
+  // 9.1 执行/重试循环 (Execution/Retry Loop)
+  // --------------------------------------------------------------
+  // 这个 `while(true)` 不是 ReAct 的思考循环，而是**容错循环**。
+  // 它不断尝试运行 Agent，直到：
+  // 1. 成功运行 (break 退出)。
+  // 2. 遇到不可恢复的错误 (return 退出)。
+  // 3. 遇到可恢复的错误（如上下文溢出），重置会话后 `continue` 重试。
   while (true) {
     try {
+      // ... (流式处理辅助函数，略) ...
       const allowPartialStream = !(
         params.followupRun.run.reasoningLevel === "stream" && params.opts?.onReasoningStream
       );
@@ -135,6 +152,8 @@ export async function runAgentTurnWithFallback(params: {
         }
         return { text: sanitized, skip: false };
       };
+      
+      // 处理打字机效果的辅助函数
       const handlePartialForTyping = async (payload: ReplyPayload): Promise<string | undefined> => {
         const { text, skip } = normalizeStreamingText(payload);
         if (skip || !text) {
@@ -145,6 +164,11 @@ export async function runAgentTurnWithFallback(params: {
       };
       const blockReplyPipeline = params.blockReplyPipeline;
       const onToolResult = params.opts?.onToolResult;
+      // --------------------------------------------------------------
+      // 9.2 带回退机制的执行 (Execution with Fallback)
+      // --------------------------------------------------------------
+      // `runWithModelFallback` 负责：如果主模型失败，自动切换到备用模型。
+      // 在它的回调函数里，我们调用了真正的 Worker。
       const fallbackResult = await runWithModelFallback({
         cfg: params.followupRun.run.config,
         provider: params.followupRun.run.provider,
@@ -155,8 +179,7 @@ export async function runAgentTurnWithFallback(params: {
           resolveAgentIdFromSessionKey(params.followupRun.run.sessionKey),
         ),
         run: (provider, model) => {
-          // Notify that model selection is complete (including after fallback).
-          // This allows responsePrefix template interpolation with the actual model.
+          // 记录模型选择完成
           params.opts?.onModelSelected?.({
             provider,
             model,
@@ -255,6 +278,17 @@ export async function runAgentTurnWithFallback(params: {
             provider === params.followupRun.run.provider
               ? params.followupRun.run.authProfileId
               : undefined;
+          // --------------------------------------------------------------
+          // 9.3 核心 ReAct 循环入口 (Active ReAct Loop Entry)
+          // --------------------------------------------------------------
+          // `runEmbeddedPiAgent` 是真正实现 ReAct 循环的地方。
+          // 它会：
+          // - 维护消息历史。
+          // - 调用 LLM。
+          // - 解析工具调用。
+          // - 执行工具。
+          // - 将工具结果作为观察 (Observation) 返回给 LLM。
+          // - 循环直到 LLM 给出最终答复。
           return runEmbeddedPiAgent({
             sessionId: params.followupRun.run.sessionId,
             sessionKey: params.sessionKey,
@@ -507,6 +541,15 @@ export async function runAgentTurnWithFallback(params: {
       const isSessionCorruption = /function call turn comes immediately after/i.test(message);
       const isRoleOrderingError = /incorrect role information|roles must alternate/i.test(message);
 
+      // --------------------------------------------------------------
+      // 9.4 错误处理与自我修复 (Error Handling & Self-Healing)
+      // --------------------------------------------------------------
+      // 如果 Agent 崩溃或报错，这里会捕获异常并尝试恢复。
+      // - 上下文溢出 (Context Overflow)：重置会话，重新开始。
+      // - 压缩失败 (Compaction Failure)：重置会话。
+      // - 角色顺序错误 (Role Ordering)：重置会话。
+      // - 会话损坏 (Session Corruption)：重置会话。
+      // 如果无法恢复，则返回错误信息给用户。
       if (
         isCompactionFailure &&
         !didResetAfterCompactionFailure &&

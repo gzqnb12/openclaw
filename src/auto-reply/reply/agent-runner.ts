@@ -44,6 +44,15 @@ import { createTypingSignaler } from "./typing-mode.js";
 
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 
+// ------------------------------------------------------------------
+// 8. Agent 运行器 (Agent Runner)
+// ------------------------------------------------------------------
+// 这是 Agent 思考和执行的核心入口。
+// 职责：
+// 1. 管理 Agent 的“思考 -> 行动 -> 观察”循环。
+// 2. 处理工具调用 (Tools)。
+// 3. 处理流式输出 (Streaming)。
+// 4. 管理记忆 (Memory) 和上下文窗口。
 export async function runReplyAgent(params: {
   commandBody: string;
   followupRun: FollowupRun;
@@ -307,6 +316,12 @@ export async function runReplyAgent(params: {
     });
   try {
     const runStartedAt = Date.now();
+    // --------------------------------------------------------------
+    // 8.1 执行 Agent 思考回合 (Execute Agent Turn)
+    // --------------------------------------------------------------
+    // **这里是核心中的核心**。
+    // 它调用 `runAgentTurnWithFallback`，真正地请求 LLM，执行 ReAct (Reasoning + Acting) 循环。
+    // 如果 LLM 返回工具调用，它会在这里执行工具，并将结果喂回给 LLM（递归过程通常在内部处理）。
     const runOutcome = await runAgentTurnWithFallback({
       commandBody,
       followupRun,
@@ -513,6 +528,12 @@ export async function runReplyAgent(params: {
       finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
     }
 
+    // --------------------------------------------------------------
+    // 8.2 返回最终结果 (Finalize & Return)
+    // --------------------------------------------------------------
+    // Agent 思考结束，生成了最终回复 Payload。
+    // `finalizeWithFollowup` 会处理可能的后续操作（如果有的话）。
+    // 这些 Payload 将会一路返回，经过 `getReply` -> `dispatchReplyFromConfig` -> `provider-dispatcher` -> `bot-handlers`，最终发送给用户。
     return finalizeWithFollowup(
       finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
       queueKey,

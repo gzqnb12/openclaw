@@ -107,6 +107,15 @@ type RunPreparedReplyParams = {
   abortedLastRun: boolean;
 };
 
+// ------------------------------------------------------------------
+// 7. 回复执行预备 (Reply Execution Prep)
+// ------------------------------------------------------------------
+// 此函数负责在 Agent 运行前构建最终的上下文和 Prompt。
+// 核心职责：
+// 1. 构建系统提示词 (System Prompt)。
+// 2. 构建用户消息体 (User Prompt)。
+// 3. 处理“思考等级” (Think Level) 和其他元数据。
+// 4. 调用 `runReplyAgent` 进入运行循环。
 export async function runPreparedReply(
   params: RunPreparedReplyParams,
 ): Promise<ReplyPayload | ReplyPayload[] | undefined> {
@@ -182,6 +191,12 @@ export async function runPreparedReply(
       })
     : "";
   const groupSystemPrompt = sessionCtx.GroupSystemPrompt?.trim() ?? "";
+  // --------------------------------------------------------------
+  // 7.1 构建系统提示词 (System Prompt Construction)
+  // --------------------------------------------------------------
+  // 这里的 `extraSystemPrompt` 包含了：
+  // - 基础元系统提示词 (Inbound Meta)：告知 Agent 当前时间、用户是谁等。
+  // - 群组介绍 (Group Intro)：如果是新会话，介绍群组背景。
   const inboundMetaPrompt = buildInboundMetaSystemPrompt(
     isNewSession ? sessionCtx : { ...sessionCtx, ThreadStarterBody: undefined },
   );
@@ -206,6 +221,13 @@ export async function runPreparedReply(
     isNewSession &&
     ((baseBodyTrimmedRaw.length === 0 && rawBodyTrimmed.length > 0) || isBareNewOrReset);
   const baseBodyFinal = isBareSessionReset ? BARE_SESSION_RESET_PROMPT : baseBody;
+  // --------------------------------------------------------------
+  // 7.2 构建用户 Prompt (User Prompt Construction)
+  // --------------------------------------------------------------
+  // `baseBodyForPrompt` 是发送给 LLM 的最终用户消息。
+  // 它通常包含：
+  // 1. 上下文前缀 (Inbound User Context)：例如引用回复的内容。
+  // 2. 实际消息体 (Base Body)：用户发送的文本。
   const inboundUserContext = buildInboundUserContextPrefix(
     isNewSession ? sessionCtx : { ...sessionCtx, ThreadStarterBody: undefined },
   );
@@ -406,6 +428,11 @@ export async function runPreparedReply(
     },
   };
 
+  // --------------------------------------------------------------
+  // 7.3 启动 Agent 运行器 (Start Agent Runner)
+  // --------------------------------------------------------------
+  // 一切准备就绪，调用 `runReplyAgent`。
+  // 注意：`extraSystemPrompt` 被打包进了 `followupRun.run` 参数中。
   return runReplyAgent({
     commandBody: prefixedCommandBody,
     followupRun,

@@ -665,44 +665,74 @@ export const registerTelegramHandlers = ({
     }
   });
 
+  // ------------------------------------------------------------------
+  // 主消息处理器 (Main Message Handler)
+  // ------------------------------------------------------------------
+  // 这是消息处理的核心入口。当任何新的 Telegram 消息到达时触发。
+  // 流程如下：
+  // 1. 基础检查：确保消息存在且未被忽略。
+  // 2. 上下文解析：提取 chatId, topicId (thread_id), 发送者信息。
+  // 3. 权限/配置加载：加载群组配置 (GroupConfig) 和允许列表 (AllowList)。
+  // 4. 访问控制：检查发送者是否有权与机器人交互（黑白名单，群策）。
+  // 5. 消息缓冲：处理“相册”（多图）和“长文本分片”。
+  // 6. 最终分发：调用 `processMessage` 进入核心逻辑。
   bot.on("message", async (ctx) => {
     try {
       const msg = ctx.message;
       if (!msg) {
         return;
       }
+      // 检查是否应该跳过此更新（例如，机器人自己的消息或过期的消息）
       if (shouldSkipUpdate(ctx)) {
         return;
       }
 
+      // --------------------------------------------------------------
+      // 2.1 上下文与配置解析
+      // --------------------------------------------------------------
       const chatId = msg.chat.id;
       const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
       const messageThreadId = msg.message_thread_id;
+      // 检查是否为论坛主题 (Forum Topic)
       const isForum = msg.chat.is_forum === true;
       const resolvedThreadId = resolveTelegramForumThreadId({
         isForum,
         messageThreadId,
       });
+
+      // 加载全局允许列表 (AllowFrom)
       const storeAllowFrom = await readChannelAllowFromStore("telegram").catch(() => []);
+      
+      // 解析群组特定的配置和主题配置
       const { groupConfig, topicConfig } = resolveTelegramGroupConfig(chatId, resolvedThreadId);
+      
+      // 确定群组是否覆盖了允许列表
       const groupAllowOverride = firstDefined(topicConfig?.allowFrom, groupConfig?.allowFrom);
+      // 标准化最终生效的允许列表
       const effectiveGroupAllow = normalizeAllowFromWithStore({
         allowFrom: groupAllowOverride ?? groupAllowFrom,
         storeAllowFrom,
       });
       const hasGroupAllowOverride = typeof groupAllowOverride !== "undefined";
 
+      // --------------------------------------------------------------
+      // 2.2 群组访问控制 (Group Access Control)
+      // --------------------------------------------------------------
       if (isGroup) {
+        // 如果群组被明确禁用，则忽略
         if (groupConfig?.enabled === false) {
           logVerbose(`Blocked telegram group ${chatId} (group disabled)`);
           return;
         }
+        // 如果特定 Topic 被禁用，则忽略
         if (topicConfig?.enabled === false) {
           logVerbose(
             `Blocked telegram topic ${chatId} (${resolvedThreadId ?? "unknown"}) (topic disabled)`,
           );
           return;
         }
+
+        // 如果配置了具体的允许列表覆盖 (AllowFrom Override)
         if (hasGroupAllowOverride) {
           const senderId = msg.from?.id;
           const senderUsername = msg.from?.username ?? "";
@@ -720,10 +750,13 @@ export const registerTelegramHandlers = ({
             return;
           }
         }
-        // Group policy filtering: controls how group messages are handled
-        // - "open": groups bypass allowFrom, only mention-gating applies
-        // - "disabled": block all group messages entirely
-        // - "allowlist": only allow group messages from senders in groupAllowFrom/allowFrom
+
+        // ------------------------------------------------------------
+        // 群组策略 (Group Policy) 检查
+        // ------------------------------------------------------------
+        // - "open": 群组消息绕过全局 allowFrom，仅受“提及 (mention)”规则限制。
+        // - "disabled": 完全阻止所有群组消息。
+        // - "allowlist": 仅允许 allowFrom 中的发送者发言。
         const defaultGroupPolicy = cfg.channels?.defaults?.groupPolicy;
         const groupPolicy = firstDefined(
           topicConfig?.groupPolicy,
@@ -732,12 +765,14 @@ export const registerTelegramHandlers = ({
           defaultGroupPolicy,
           "open",
         );
+
         if (groupPolicy === "disabled") {
           logVerbose(`Blocked telegram group message (groupPolicy: disabled)`);
           return;
         }
+
         if (groupPolicy === "allowlist") {
-          // For allowlist mode, the sender (msg.from.id) must be in allowFrom
+          // 在白名单模式下，必须验证发送者 ID
           const senderId = msg.from?.id;
           if (senderId == null) {
             logVerbose(`Blocked telegram group message (no sender ID, groupPolicy: allowlist)`);
@@ -773,13 +808,18 @@ export const registerTelegramHandlers = ({
         }
       }
 
-      // Text fragment handling - Telegram splits long pastes into multiple inbound messages (~4096 chars).
-      // We buffer “near-limit” messages and append immediately-following parts.
+      // --------------------------------------------------------------
+      // 2.3 文本分片缓冲 (Text Fragment Buffering)
+      // --------------------------------------------------------------
+      // Telegram 可能会把一条非常长的消息（例如粘贴的代码）拆分成多个大约 4096 字符的消息连续发送。
+      // 这个逻辑用于检测并重新组装这些分片，以便 Agent 可以一次性看到完整的上下文。
       const text = typeof msg.text === "string" ? msg.text : undefined;
       const isCommandLike = (text ?? "").trim().startsWith("/");
+      // 如果是纯文本且不是命令（命令通常很短，不需要缓冲）
       if (text && !isCommandLike) {
         const nowMs = Date.now();
         const senderId = msg.from?.id != null ? String(msg.from.id) : "unknown";
+        // 缓冲区键值：基于聊天、话题和发送者
         const key = `text:${chatId}:${resolvedThreadId ?? "main"}:${senderId}`;
         const existing = textFragmentBuffer.get(key);
 
@@ -787,6 +827,7 @@ export const registerTelegramHandlers = ({
           const last = existing.messages.at(-1);
           const lastMsgId = last?.msg.message_id;
           const lastReceivedAtMs = last?.receivedAtMs ?? nowMs;
+          // 启发式检查：ID 连续且时间间隔很短
           const idGap = typeof lastMsgId === "number" ? msg.message_id - lastMsgId : Infinity;
           const timeGapMs = nowMs - lastReceivedAtMs;
           const canAppend =
@@ -801,17 +842,19 @@ export const registerTelegramHandlers = ({
               0,
             );
             const nextTotalChars = currentTotalChars + text.length;
+            // 如果未超过最大分片数和总字符限制，则追加
             if (
               existing.messages.length + 1 <= TELEGRAM_TEXT_FRAGMENT_MAX_PARTS &&
               nextTotalChars <= TELEGRAM_TEXT_FRAGMENT_MAX_TOTAL_CHARS
             ) {
               existing.messages.push({ msg, ctx, receivedAtMs: nowMs });
+              // 重置定时器，等待更多分片
               scheduleTextFragmentFlush(existing);
               return;
             }
           }
 
-          // Not appendable (or limits exceeded): flush buffered entry first, then continue normally.
+          // 如果不能追加（或超过限制）：先刷新缓冲区中的内容，然后作为新消息继续
           clearTimeout(existing.timer);
           textFragmentBuffer.delete(key);
           textFragmentProcessing = textFragmentProcessing
@@ -822,6 +865,7 @@ export const registerTelegramHandlers = ({
           await textFragmentProcessing;
         }
 
+        // 如果这是一条长消息的开始（超过阈值），开始缓冲
         const shouldStart = text.length >= TELEGRAM_TEXT_FRAGMENT_START_THRESHOLD_CHARS;
         if (shouldStart) {
           const entry: TextFragmentEntry = {
@@ -835,11 +879,16 @@ export const registerTelegramHandlers = ({
         }
       }
 
-      // Media group handling - buffer multi-image messages
+      // --------------------------------------------------------------
+      // 2.4 媒体组缓冲 (Media Group / Album Buffering)
+      // --------------------------------------------------------------
+      // Telegram 将包含多张图片的消息（相册）作为带有相同 `media_group_id` 的多个独立消息发送。
+      // 我们必须缓冲它们，以便只向 Agent 发送一条包含所有图片的消息，而不是每张图片触发一次回复。
       const mediaGroupId = msg.media_group_id;
       if (mediaGroupId) {
         const existing = mediaGroupBuffer.get(mediaGroupId);
         if (existing) {
+          // 如果已存在该组的缓冲区，追加并重置超时
           clearTimeout(existing.timer);
           existing.messages.push({ msg, ctx });
           existing.timer = setTimeout(async () => {
@@ -852,6 +901,7 @@ export const registerTelegramHandlers = ({
             await mediaGroupProcessing;
           }, MEDIA_GROUP_TIMEOUT_MS);
         } else {
+          // 新的媒体组：开始缓冲
           const entry: MediaGroupEntry = {
             messages: [{ msg, ctx }],
             timer: setTimeout(async () => {
@@ -866,6 +916,7 @@ export const registerTelegramHandlers = ({
           };
           mediaGroupBuffer.set(mediaGroupId, entry);
         }
+        // 关键：因为我们在缓冲，所以这里直接返回，不处理单个消息
         return;
       }
 

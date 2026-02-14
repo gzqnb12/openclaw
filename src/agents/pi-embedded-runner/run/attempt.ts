@@ -137,6 +137,17 @@ export function injectHistoryImagesIntoMessages(
   return didMutate;
 }
 
+// ------------------------------------------------------------------
+// 11. ReAct 核心尝试 (ReAct Core Attempt) - 真正的心脏
+// ------------------------------------------------------------------
+// `runEmbeddedAttempt` 封装了一次完整的 Agent 执行过程 (Turn)。
+// 这里包含了**所有**构建 Agent 所需的要素：
+// 1. **沙箱环境 (Sandbox)**：安全地隔离文件系统操作。
+// 2. **技能加载 (Skills)**：加载 Agent 具备的能力。
+// 3. **系统提示词 (System Prompt)**：构建那段几千字的 System Prompt。
+// 4. **会话管理 (Session Management)**：加载历史消息，修复损坏的会话文件。
+// 5. **工具注册 (Tools)**：注册所有可用的工具函数。
+// 6. **执行代理 (Execution)**：调用 `activeSession.start()` 启动 ReAct 循环。
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
 ): Promise<EmbeddedRunAttemptResult> {
@@ -206,6 +217,12 @@ export async function runEmbeddedAttempt(
 
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
+    // --------------------------------------------------------------
+    // 11.1 工具集创建 (Tool Set Creation)
+    // --------------------------------------------------------------
+    // 这里创建了 Agent 可以使用的所有工具（Tools）。
+    // `createOpenClawCodingTools` 会返回一个包含所有工具函数的对象。
+    // 如果是 Google 模型，还会对工具定义进行特殊清洗（Sanitization）。
     const toolsRaw = params.disableTools
       ? []
       : createOpenClawCodingTools({
@@ -348,6 +365,11 @@ export async function runEmbeddedAttempt(
     });
     const ttsHint = params.config ? buildTtsSystemPromptHint(params.config) : undefined;
 
+    // --------------------------------------------------------------
+    // 11.2 系统提示词构建 (System Prompt Construction)
+    // --------------------------------------------------------------
+    // 这里将所有上下文信息（时间、操作系统、工具列表、技能文档等）
+    // 拼接成最终发送给 LLM 的 System Prompt。
     const appendPrompt = buildEmbeddedSystemPrompt({
       workspaceDir: effectiveWorkspace,
       defaultThinkLevel: params.thinkLevel,
@@ -475,6 +497,11 @@ export async function runEmbeddedAttempt(
 
       const allCustomTools = [...customTools, ...clientToolDefs];
 
+      // --------------------------------------------------------------
+      // 11.3 会话创建初始化 (Session Creation & Initialization)
+      // --------------------------------------------------------------
+      // `createAgentSession` 初始化了 `pi-agent-core` 的 Session 对象。
+      // 这个对象维护了对话历史 (Messages) 和流式响应状态。
       ({ session } = await createAgentSession({
         cwd: resolvedWorkspace,
         agentDir,
@@ -621,6 +648,12 @@ export async function runEmbeddedAttempt(
         });
       };
 
+      // --------------------------------------------------------------
+      // 11.4 订阅 Agent 事件 (Subscribe to Agent Events)
+      // --------------------------------------------------------------
+      // `subscribeEmbeddedPiSession` 将 Agent 的内部事件（思考、工具执行、结果返回）
+      // 桥接到外部的回调函数（`params.onToolResult` 等）。
+      // 这样 Agent Runner 才能感知到内部发生了什么，并生成用户可见的回复。
       const subscription = subscribeEmbeddedPiSession({
         session: activeSession,
         runId: params.runId,
@@ -814,9 +847,19 @@ export async function runEmbeddedAttempt(
             });
           }
 
-          // Only pass images option if there are actually images to pass
-          // This avoids potential issues with models that don't expect the images parameter
-          if (imageResult.images.length > 0) {
+        // --------------------------------------------------------------
+        // 11.5 启动 ReAct 循环! (Start the ReAct Loop!)
+        // --------------------------------------------------------------
+        // `activeSession.prompt(effectivePrompt)` 是点火开关。
+        // 它会：
+        // 1. 将 Prompt 作为 User Message 添加到历史。
+        // 2. 调用 LLM。
+        // 3. 处理流式返回。
+        // 4. 如果有 Tool Calls，自动执行工具。
+        // 5. 将 Tool Result 添加到历史。
+        // 6. 重复步骤 2，直到 LLM 停止工具调用并输出最终回复。
+        // 这个 `await` 会一直持续到整个对话 Turn 结束。
+        if (imageResult.images.length > 0) {
             await abortable(activeSession.prompt(effectivePrompt, { images: imageResult.images }));
           } else {
             await abortable(activeSession.prompt(effectivePrompt));

@@ -395,6 +395,22 @@ export async function startGatewayServer(
   // ----------------------------------------------------------------
   
   // Node Registry: 管理连接的物理节点（手机/电脑）及其能力 (Caps)
+  // ----------------------------------------------------------------
+  // 底层实现原理 (Based on src/gateway/node-registry.ts)：
+  // 1. **双向索引 (Bi-directional Indexing)**:
+  //    内部维护了两个 Map：
+  //    - `nodesById`: nodeId -> NodeSession (存节点的详细信息，如 IP、版本、能力集)
+  //    - `nodesByConn`: connId -> nodeId (反向查找，用于处理 socket 断开时的清理)
+  //
+  // 2. **能力与权限 (Capabilities & Permissions)**:
+  //    节点连接时会通过握手包 (Handshake) 上报自己的 `caps` (如 ["camera", "location"])。
+  //    Registry 会记录这些 Caps，供 Agent 在规划任务时查询（"哪个节点有摄像头？"）。
+  //
+  // 3. **RPC 调用机制 (Invoke Mechanism)**:
+  //    Gateway 可以主动调用节点的方法（如 `invoke({ nodeId, command: "take_photo" })`）。
+  //    - **请求 (Request)**: 生成唯一 `requestId`，通过 WebSocket 发送 `node.invoke.request` 事件。
+  //    - **挂起 (Pending)**: 将 `resolve/reject` 句柄存入 `pendingInvokes` Map，并设置超时定时器。
+  //    - **响应 (Response)**: 收到节点发回的 `node.invoke.result` 事件后，根据 `requestId` 找到对应的 Promise 并 resolve。
   const nodeRegistry = new NodeRegistry();
   const nodePresenceTimers = new Map<string, ReturnType<typeof setInterval>>();
   const nodeSubscriptions = createNodeSubscriptionManager();
@@ -449,6 +465,18 @@ export async function startGatewayServer(
   bonjourStop = discovery.bonjourStop;
 
   // Skills Sync: 负责将与节点相关的技能配置同步给远程节点
+  // 技能系统与节点注册表的桥接 (Skills <-> Node Bridge)
+  // ----------------------------------------------------------------
+  // 这一步至关重要：它将 "Node Registry"（物理设备管理）注入到 "Skills System"（能力系统）。
+  //
+  // **为什么需要这一步？**
+  // OpenClaw 的 Skills 系统需要知道哪些 Skill 可以在哪些节点上运行。
+  // 例如，如果一个 Skill 需要 `ffmpeg`，系统需要知道哪个连接的节点装了 `ffmpeg`。
+  //
+  // **setSkillsRemoteRegistry 做了什么？**
+  // 1. **依赖注入**: 把 `nodeRegistry` 实例传给 `src/infra/skills-remote.ts`。
+  // 2. **能力探测**: 允许 Skills 系统通过 `nodeRegistry.invoke(...)` 主动在远程节点上执行命令（如 `which ffmpeg`）。
+  // 3. **动态感知**: 当新节点连接时，Skills 系统能自动探测其环境，并告知 Agent：“现在有一个 Mac 节点可用，支持 X, Y, Z 能力”。
   setSkillsRemoteRegistry(nodeRegistry);
   void primeRemoteSkillsCache();
   // Debounce skills-triggered node probes to avoid feedback loops and rapid-fire invokes.
@@ -489,6 +517,16 @@ export async function startGatewayServer(
   });
 
   // Agent Events: 处理 Agent 产生的 Token 生成、工具调用等事件，并通过 WS 广播
+  // 代理事件监听器 (Agent Event Listener)
+  // ----------------------------------------------------------------
+  // 这里的 `onAgentEvent` 订阅了 Agent 内部发出的所有事件 (思考、工具调用、结果输出)。
+  // 并通过 `createAgentEventHandler` 将这些事件转发给外部世界。
+  //
+  // **createAgentEventHandler 的核心职责**:
+  // 1. **状态同步**: 更新 `chatRunState`，管理流式输出的缓冲区 (Buffer) 和增量更新 (Delta)。
+  // 2. **WS 广播**: 将事件通过 WebSocket (`broadcast`) 推送给前端 Control UI。
+  // 3. **会话同步**: 如果是聊天会话，通过 `nodeSendToSession` 将结果推回给聊天源头 (如 Telegram/Slack/Webchat)。
+  // 4. **工具结果路由**: 如果是 Tool 调用结果，定向路由给发起调用的连接 (`broadcastToConnIds`)。
   const agentUnsub = onAgentEvent(
     createAgentEventHandler({
       broadcast,

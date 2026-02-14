@@ -79,6 +79,11 @@ export type DispatchFromConfigResult = {
   counts: Record<ReplyDispatchKind, number>;
 };
 
+// ------------------------------------------------------------------
+// 5. 通用配置分发器 (Generic Configuration Dispatcher)
+// ------------------------------------------------------------------
+// 这个函数是所有渠道（Telegram, Slack 等）消息的汇聚点。
+// 它不再关心消息来源的具体协议，只关心标准化的 `MsgContext`。
 export async function dispatchReplyFromConfig(params: {
   ctx: FinalizedMsgContext;
   cfg: OpenClawConfig;
@@ -87,6 +92,11 @@ export async function dispatchReplyFromConfig(params: {
   replyResolver?: typeof getReplyFromConfig;
 }): Promise<DispatchFromConfigResult> {
   const { ctx, cfg, dispatcher } = params;
+  
+  // --------------------------------------------------------------
+  // 5.1 诊断与追踪 (Diagnostics & Tracking)
+  // --------------------------------------------------------------
+  // 开启诊断日志，记录消息处理的开始时间、会话 ID 等。
   const diagnosticsEnabled = isDiagnosticsEnabled(cfg);
   const channel = String(ctx.Surface ?? ctx.Provider ?? "unknown").toLowerCase();
   const chatId = ctx.To ?? ctx.From;
@@ -294,6 +304,17 @@ export async function dispatchReplyFromConfig(params: {
 
     const shouldSendToolSummaries = ctx.ChatType !== "group" && ctx.CommandSource !== "native";
 
+    // --------------------------------------------------------------
+    // 5.2 获取回复 (Get Reply) - 关键步骤
+    // --------------------------------------------------------------
+    // 这里调用 `getReplyFromConfig`（或传入的解析器）。
+    // 这是通往 Agent 执行环境的入口。
+    // 它会：
+    // 1. 初始化会话状态。
+    // 2. 准备 Prompt。
+    // 3. 运行 Agent 并获取结果（ReplyPayload）。
+    //
+    // 这里的回调函数 `onToolResult` 和 `onBlockReply` 用于处理流式输出和工具结果。
     const replyResult = await (params.replyResolver ?? getReplyFromConfig)(
       ctx,
       {
@@ -301,6 +322,7 @@ export async function dispatchReplyFromConfig(params: {
         onToolResult: shouldSendToolSummaries
           ? (payload: ReplyPayload) => {
               const run = async () => {
+                // 处理工具执行结果的 TTS（如果需要）
                 const ttsPayload = await maybeApplyTtsToPayload({
                   payload,
                   cfg,
@@ -348,6 +370,12 @@ export async function dispatchReplyFromConfig(params: {
       cfg,
     );
 
+    // --------------------------------------------------------------
+    // 5.3 处理最终回复 (Final Reply Handling)
+    // --------------------------------------------------------------
+    // 当 `getReplyFromConfig` 返回时，我们得到了一组因为某些原因没能流式传输的“最终回复”。
+    // 通常在流式模式下，大部分内容已经通过 `onBlockReply` 发送了。
+    // 但如果有剩余的 Payload（例如非流式的短回复），在这里统一处理。
     const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
 
     let queuedFinal = false;

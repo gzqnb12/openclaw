@@ -50,6 +50,15 @@ function mergeSkillFilters(channelFilter?: string[], agentFilter?: string[]): st
   return channel.filter((name) => agentSet.has(name));
 }
 
+// ------------------------------------------------------------------
+// 6. 回复准备与会话管理 (Reply Preparation & Session Management)
+// ------------------------------------------------------------------
+// 此函数负责 Agent 执行前的所有准备工作。
+// 核心职责：
+// 1. 确定会话 ID 和 Agent ID。
+// 2. 加载会话状态 (Session State)。
+// 3. 处理“内联指令” (Inline Directives) 和“快捷指令”。
+// 4. 调用 `runPreparedReply` 执行具体的回复逻辑。
 export async function getReplyFromConfig(
   ctx: MsgContext,
   opts?: GetReplyOptions,
@@ -135,6 +144,11 @@ export async function getReplyFromConfig(
     cfg,
     commandAuthorized,
   });
+  // --------------------------------------------------------------
+  // 6.1 会话状态初始化 (Session Initialization)
+  // --------------------------------------------------------------
+  // 加载或创建会话。这是“记忆”的关键。
+  // 它会从磁盘或数据库加载此聊天的历史记录和状态。
   const sessionState = await initSessionState({
     ctx: finalized,
     cfg,
@@ -287,6 +301,11 @@ export async function getReplyFromConfig(
     workspaceDir,
   });
 
+  // --------------------------------------------------------------
+  // 6.2 执行准备好的回复逻辑 (Run Prepared Reply)
+  // --------------------------------------------------------------
+  // 所有状态已就绪（权限、会话、上下文）。
+  // 现在调用 `runPreparedReply` 来构建 Prompt 并运行 Agent。
   return runPreparedReply({
     ctx,
     sessionCtx,

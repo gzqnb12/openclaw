@@ -217,6 +217,21 @@ export type AgentEventHandlerOptions = {
   toolEventRecipients: ToolEventRecipientRegistry;
 };
 
+/**
+ * 创建 Agent 事件处理器 (Core Event Handler Factory)
+ * ----------------------------------------------------------------
+ * 这是 Gateway 处理 Agent 所有动态的核心工厂函数。它返回一个闭包函数，
+ * 该函数会被注册到 Event Bus 上，监听每一个 Agent 的心跳、思考和行动。
+ *
+ * **核心架构 (Architecture)**:
+ * 1. **标准化 (Normalization)**: 接收原始的 `AgentEventPayload`。
+ * 2. **上下文关联 (Contextualization)**: 尝试将孤立的 Run ID 关联到具体的 Chat Session。
+ * 3. **状态累积 (State Accumulation)**: 使用 buffer 累积零散的 token，拼凑成完整的句子。
+ * 4. **分级广播 (Tiered Broadcasting)**:
+ *    - **Global**: 广播给所有连入的 Control UI (`broadcast`).
+ *    - **Targeted**: 定向发送给发起任务的 Tools (`broadcastToConnIds`).
+ *    - **Session**: 回传给聊天触发源 (`nodeSendToSession`).
+ */
 export function createAgentEventHandler({
   broadcast,
   broadcastToConnIds,
@@ -227,7 +242,12 @@ export function createAgentEventHandler({
   clearAgentRunContext,
   toolEventRecipients,
 }: AgentEventHandlerOptions) {
+  // 1. 增量更新发射器 (The Delta Emitter)
+  // ----------------------------------------------------------------
+  // 当 Agent 正在思考并逐字吐出内容时调用。
+  // 它负责维护一个 "Buffer" (缓冲区)，防止网络抖动，并控制发送频率 (Debounce)。
   const emitChatDelta = (sessionKey: string, clientRunId: string, seq: number, text: string) => {
+    // 将最新的完整文本存入 Buffer (注意：这里存的是全量文本，不是增量)
     chatRunState.buffers.set(clientRunId, text);
     const now = Date.now();
     const last = chatRunState.deltaSentAt.get(clientRunId) ?? 0;
@@ -253,6 +273,10 @@ export function createAgentEventHandler({
     nodeSendToSession(sessionKey, "chat", payload);
   };
 
+  // 2. 终态发射器 (The Finalizer)
+  // ----------------------------------------------------------------
+  // 当 Agent 完成了一次完整的思考（或出错）时调用。
+  // 它负责取出 Buffer 中的最后内容，打包成最终消息，并以此终结该次 Run。
   const emitChatFinal = (
     sessionKey: string,
     clientRunId: string,
@@ -261,6 +285,7 @@ export function createAgentEventHandler({
     error?: unknown,
   ) => {
     const text = chatRunState.buffers.get(clientRunId)?.trim() ?? "";
+    // 清理状态：任务结束了，不再需要 Buffer 和计时器
     chatRunState.buffers.delete(clientRunId);
     chatRunState.deltaSentAt.delete(clientRunId);
     if (jobState === "done") {
@@ -317,7 +342,12 @@ export function createAgentEventHandler({
     }
   };
 
+  // 3. 主事件处理逻辑 (The Main Loop)
+  // ----------------------------------------------------------------
+  // 这就是实际处理每一个 Event 的地方。
   return (evt: AgentEventPayload) => {
+    // 尝试找回上下文：这个 Run 属于哪个 Session？
+    // 如果是聊天触发的 Run，注册表中会有记录 (chatLink)。
     const chatLink = chatRunState.registry.peek(evt.runId);
     const sessionKey = chatLink?.sessionKey ?? resolveSessionKeyForRun(evt.runId);
     const clientRunId = chatLink?.clientRunId ?? evt.runId;
@@ -338,6 +368,10 @@ export function createAgentEventHandler({
             return sessionKey ? { ...evt, sessionKey, data } : { ...evt, data };
           })()
         : agentPayload;
+    // 4. 序号检查 (Sequence Check)
+    // ----------------------------------------------------------------
+    // 确保消息是有序到达的。如果发现序号跳变 (Gap)，说明中间丢包了，
+    // 虽然这里只是记录 Error，但在分布式系统中这是关键的可观测性指标。
     if (evt.seq !== last + 1) {
       broadcast("agent", {
         runId: evt.runId,
@@ -353,15 +387,14 @@ export function createAgentEventHandler({
     }
     agentRunSeq.set(evt.runId, evt.seq);
     if (isToolEvent) {
-      // Always broadcast tool events to registered WS recipients with
-      // tool-events capability, regardless of verboseLevel. The verbose
-      // setting only controls whether tool details are sent as channel
-      // messages to messaging surfaces (Telegram, Discord, etc.).
+      // Tools Output: 如果这包含敏感的 Tool 结果 (Result)，根据 verbosity 决定是否向外广播
+      // 这里的策略是：如果你不是这次 Tool调用的发起者，你可能无权看到详细结果，除非 verbosity=full。
       const recipients = toolEventRecipients.get(evt.runId);
       if (recipients && recipients.size > 0) {
         broadcastToConnIds("agent", toolPayload, recipients);
       }
     } else {
+      // 普通广播：直接推给所有人 (Control UI)
       broadcast("agent", agentPayload);
     }
 
@@ -369,8 +402,10 @@ export function createAgentEventHandler({
       evt.stream === "lifecycle" && typeof evt.data?.phase === "string" ? evt.data.phase : null;
 
     if (sessionKey) {
-      // Send tool events to node/channel subscribers only when verbose is enabled;
-      // WS clients already received the event above via broadcastToConnIds.
+      // 5. 聊天回传 (Chat Echo)
+      // ----------------------------------------------------------------
+      // 如果这是一个聊天会话 (sessionKey 存在)，我们需要把 Agent 的反应
+      // 推送回聊天界面 (Telegram, Slack, etc)。
       if (!isToolEvent || toolVerbose !== "off") {
         nodeSendToSession(sessionKey, "agent", isToolEvent ? toolPayload : agentPayload);
       }

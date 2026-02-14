@@ -61,9 +61,31 @@ export type ChannelManager = {
 };
 
 // Channel docking: lifecycle hooks (`plugin.gateway`) flow through this manager.
+/**
+ * 创建渠道管理器 (Channel Manager Factory)
+ * ----------------------------------------------------------------
+ * 这是一个核心工厂函数，负责管理所有外部通信渠道 (Telegram, Discord, Slack 等) 的生命周期。
+ *
+ * **核心设计模式 (Design Pattern)**:
+ * 1. **工厂模式 (Factory)**: 创建并返回一个 `ChannelManager` 实例对象。
+ * 2. **闭包状态 (Closure State)**: `channelStores` 变量定义在函数内部，
+ *    而返回的 `startChannel`, `stopChannel` 等方法都引用了这个变量。
+ *    这意味着 `channelStores` 是私有的、持久的，并且对外部隐藏，只有通过这些方法才能访问。
+ *
+ * **主要职责**:
+ * 1. **生命周期管理**: 启动 (`startChannel`) 和停止 (`stopChannel`) 各个渠道的后台服务。
+ * 2. **状态持有**: 记录每个渠道的运行状态 (`running`, `connected`, `lastError`)。
+ * 3. **资源管控**: 持有 `AbortController`，用于强制终止挂起的连接任务。
+ */
 export function createChannelManager(opts: ChannelManagerOptions): ChannelManager {
   const { loadConfig, channelLogs, channelRuntimeEnvs } = opts;
 
+  // **私有状态仓库 (The Private State Store)**
+  // 这里的 `channelStores` 就是闭包的核心。它不对外暴露，只有内部函数能读写它。
+  // 它保存了每个 Channel 的：
+  // - `aborts`: 用于取消正在运行的任务的控制器。
+  // - `tasks`:正在执行的 Promise 任务 (如长轮询循环)。
+  // - `runtimes`: 当前的运行状态快照 (是否在线、错误信息等)。
   const channelStores = new Map<ChannelId, ChannelRuntimeStore>();
 
   const getStore = (channelId: ChannelId): ChannelRuntimeStore => {
@@ -93,6 +115,9 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     return next;
   };
 
+  // **启动渠道 (Start Channel)**
+  // ----------------------------------------------------------------
+  // 这个函数负责“唤醒”一个渠道插件。
   const startChannel = async (channelId: ChannelId, accountId?: string) => {
     const plugin = getChannelPlugin(channelId);
     const startAccount = plugin?.gateway?.startAccount;
@@ -140,6 +165,7 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
 
         const abort = new AbortController();
         store.aborts.set(id, abort);
+        // 更新状态为：正在运行
         setRuntime(channelId, id, {
           accountId: id,
           running: true,
@@ -178,6 +204,10 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     );
   };
 
+  // **停止渠道 (Stop Channel)**
+  // ----------------------------------------------------------------
+  // 优雅地关闭渠道。它会触发 `abortController.abort()`，通知所有正在进行的
+  // 网络请求或长轮询循环立即停止。
   const stopChannel = async (channelId: ChannelId, accountId?: string) => {
     const plugin = getChannelPlugin(channelId);
     const cfg = loadConfig();
